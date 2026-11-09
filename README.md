@@ -45,6 +45,8 @@ sh install.sh --help
 | `--fingerprint sha256:…` | the cockpit's certificate fingerprint (required) |
 | `--code CODE` | the one-time pairing code |
 | `--name NAME` | the name this computer shows in the cockpit |
+| `--hub-host HOST` | override the pairing hub's address (default: from the cockpit) |
+| `--hub-port PORT` | override the pairing hub's port (default: from the cockpit) |
 | `--no-service` | do not register a background service |
 | `--no-openclaw` | install the connector only |
 | `--dry-run` | print what would happen, change nothing |

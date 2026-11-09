@@ -33,6 +33,7 @@ COCKPIT=""          # host:port of the cockpit's download endpoint
 FINGERPRINT=""      # sha256:… of the cockpit certificate
 CODE=""             # one-time pairing code
 NAME=""             # display name for this computer
+HUB_HOST=""         # override the connector hub host from the manifest
 HUB_PORT=""         # override the connector hub port from the manifest
 BUNDLE_URL=""       # override the connector bundle URL
 BUNDLE_SHA=""       # override the connector bundle checksum
@@ -56,6 +57,7 @@ Agent Cockpit — Installation des Connectors
   --fingerprint sha256:… Zertifikat-Fingerabdruck des Cockpits (steht im Cockpit)
   --code CODE            einmaliger Kopplungscode (steht im Cockpit)
   --name NAME            Name dieses Computers (Standard: Hostname)
+  --hub-host HOST        Adresse des Connector-Kanals überschreiben
   --hub-port PORT        Port des Connector-Kanals überschreiben
   --bundle URL           Connector-Paket überschreiben
   --bundle-sha256 HEX    Prüfsumme des Connector-Pakets überschreiben
@@ -75,6 +77,7 @@ while [ $# -gt 0 ]; do
     --fingerprint)    FINGERPRINT="${2:-}"; shift 2 ;;
     --code)           CODE="${2:-}"; shift 2 ;;
     --name)           NAME="${2:-}"; shift 2 ;;
+    --hub-host)       HUB_HOST="${2:-}"; shift 2 ;;
     --hub-port)       HUB_PORT="${2:-}"; shift 2 ;;
     --bundle)         BUNDLE_URL="${2:-}"; shift 2 ;;
     --bundle-sha256)  BUNDLE_SHA="${2:-}"; shift 2 ;;
@@ -89,6 +92,7 @@ while [ $# -gt 0 ]; do
     --fingerprint=*)  FINGERPRINT="${1#*=}"; shift ;;
     --code=*)         CODE="${1#*=}"; shift ;;
     --name=*)         NAME="${1#*=}"; shift ;;
+    --hub-host=*)     HUB_HOST="${1#*=}"; shift ;;
     --hub-port=*)     HUB_PORT="${1#*=}"; shift ;;
     --bundle=*)       BUNDLE_URL="${1#*=}"; shift ;;
     --bundle-sha256=*) BUNDLE_SHA="${1#*=}"; shift ;;
@@ -403,10 +407,16 @@ do_install() {
   MV="$(read_manifest "['manifest_version']" 2>/dev/null || echo '')"
   [ "$MV" = "$MANIFEST_VERSION" ] || die "Der Server spricht eine andere Installationsversion ($MV). Bitte Cockpit und Installer aktualisieren."
   [ -n "$HUB_PORT" ] || HUB_PORT="$(read_manifest "['hub']['port']")"
+  # The hub can live at a different address than the download endpoint — a
+  # tunnel hands out one host per forwarded port.  The manifest says where it is;
+  # the download host is only the fallback, so a computer that downloaded the
+  # installer successfully still pairs against the port it can actually reach.
+  [ -n "$HUB_HOST" ] || HUB_HOST="$(read_manifest "['hub']['host']" 2>/dev/null || echo '')"
+  [ -n "$HUB_HOST" ] || HUB_HOST="$DIST_HOST"
   [ -n "$BUNDLE_URL" ] || BUNDLE_URL="$(read_manifest "['bundle']['url']")"
   [ -n "$BUNDLE_SHA" ] || BUNDLE_SHA="$(read_manifest "['bundle']['sha256']")"
   OC_VERSION="$(read_manifest "['openclaw']['version']")"
-  ok "Cockpit erkannt (Installer-Version $MV)"
+  ok "Cockpit erkannt (Installer-Version $MV, Connector-Kanal $HUB_HOST:$HUB_PORT)"
 
   if [ "$DRY_RUN" = "1" ]; then
     say ""
@@ -449,7 +459,7 @@ do_install() {
   if [ -n "$CODE" ]; then
     step "Computer mit dem Cockpit koppeln"
     if COCKPIT_CONNECTOR_HOME="$ROOT" COCKPIT_CONNECTOR_ROOT="$ROOT" \
-        "$PY" "$PYZ" pair --cockpit-host "$DIST_HOST" --cockpit-port "$HUB_PORT" \
+        "$PY" "$PYZ" pair --cockpit-host "$HUB_HOST" --cockpit-port "$HUB_PORT" \
           --fingerprint "$FINGERPRINT" --code "$CODE" --name "$NAME"; then
       PAIR_RESULT="ok"
       ok "Dieser Computer ist mit dem Cockpit verbunden."
