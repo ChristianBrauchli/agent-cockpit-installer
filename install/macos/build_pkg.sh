@@ -25,10 +25,17 @@ IDENTIFIER="${IDENTIFIER:-com.agentcockpit.installer}"
 command -v pkgbuild >/dev/null 2>&1 \
   || { echo "pkgbuild not found — this script builds macOS packages and needs macOS." >&2; exit 2; }
 
-installer="$ROOT/install/install.sh"
-[ -f "$installer" ] || { echo "install.sh not found at $installer" >&2; exit 2; }
+# The installer lives in `install/` in the cockpit checkout and at the root of
+# the distribution repository, so accept either layout.
+installer=""
+for candidate in "$ROOT/install/install.sh" "$ROOT/install.sh"; do
+  if [ -f "$candidate" ]; then installer="$candidate"; break; fi
+done
+[ -n "$installer" ] \
+  || { echo "install.sh not found (looked in install/ and the repository root)" >&2; exit 2; }
 [ -f "$HERE/app/Info.plist" ] || { echo "Info.plist missing" >&2; exit 2; }
 [ -f "$HERE/app/agent-cockpit-pair" ] || { echo "pairing helper missing" >&2; exit 2; }
+[ -f "$HERE/README.txt" ] || { echo "README.txt missing" >&2; exit 2; }
 
 WORK="$(mktemp -d)"
 trap 'rm -rf "$WORK"' EXIT
