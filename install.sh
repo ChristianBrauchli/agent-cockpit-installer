@@ -419,13 +419,16 @@ do_install() {
   fi
 
   # -- pairing -------------------------------------------------------------
+  PAIR_RESULT="skipped"
   if [ -n "$CODE" ]; then
     step "Computer mit dem Cockpit koppeln"
     if COCKPIT_CONNECTOR_HOME="$ROOT" COCKPIT_CONNECTOR_ROOT="$ROOT" \
         "$PY" "$PYZ" pair --cockpit-host "$DIST_HOST" --cockpit-port "$HUB_PORT" \
           --fingerprint "$FINGERPRINT" --code "$CODE" --name "$NAME"; then
+      PAIR_RESULT="ok"
       ok "Dieser Computer ist mit dem Cockpit verbunden."
     else
+      PAIR_RESULT="failed"
       warn "Die Kopplung ist nicht gelungen. Der Code ist nur einmal und nur kurz gültig."
       warn "Im Cockpit einen neuen Code erzeugen und diesen Befehl erneut ausführen."
     fi
@@ -443,9 +446,26 @@ do_install() {
     esac
   fi
 
-  step "Fertig"
-  say "   Der Connector läuft im Hintergrund und verbindet sich automatisch neu."
-  say "   Öffne das Cockpit und wähle diesen Computer als Agentenlaufzeit aus."
+  # -- what actually happened ---------------------------------------------
+  # The last screen has to say whether the *pairing* succeeded.  It used to
+  # print the same "everything is connected" summary after a rejected code,
+  # which is exactly the kind of claim the product must never make.
+  step "Ergebnis"
+  case "$PAIR_RESULT" in
+    ok)
+      say "   Dieser Computer ist mit dem Cockpit verbunden."
+      say "   Der Connector läuft im Hintergrund und verbindet sich automatisch neu."
+      say "   Öffne das Cockpit und wähle diesen Computer als Agentenlaufzeit aus."
+      ;;
+    failed)
+      say "   Die Installation ist abgeschlossen, die Kopplung aber NICHT."
+      say "   Erzeuge im Cockpit einen neuen Code und führe denselben Befehl erneut aus."
+      ;;
+    *)
+      say "   Der Connector ist installiert, aber noch nicht gekoppelt."
+      say "   Die Kopplung erfolgt im Cockpit unter „Computer verbinden“."
+      ;;
+  esac
   say ""
   say "   Deinstallieren:  sh install.sh --uninstall   (Agentendaten bleiben erhalten)"
 }
