@@ -21,6 +21,12 @@ set -eu
 INSTALLER_VERSION="0.1.0"
 MANIFEST_VERSION="1"
 
+# Network behaviour.  A computer behind a firewall that silently drops packets
+# must fail with a sentence within a sane time, not hang until the user gives up.
+CONNECT_TIMEOUT="${COCKPIT_CONNECT_TIMEOUT:-15}"
+READ_TIMEOUT="${COCKPIT_READ_TIMEOUT:-90}"
+FETCH_ATTEMPTS="${COCKPIT_FETCH_ATTEMPTS:-3}"
+
 # ---------------------------------------------------------------- output ----
 say()  { printf '%s\n' "$*"; }
 step() { printf '\n== %s\n' "$*"; }
@@ -139,36 +145,129 @@ PY
 
 # Fetch a path from the cockpit over TLS pinned to $FINGERPRINT.
 #   pinned_get HOST PORT PATH OUTFILE   (OUTFILE "-" writes to stdout)
+#
+# The pin, not a CA chain, is what makes this transport trusted: the cockpit's
+# certificate is self-signed, so a browser shows a warning for the same name —
+# and that is exactly why this command does not depend on the browser, and why
+# the certificate is checked here against the fingerprint the operator pasted.
+#
+# Exit codes let fetch() tell a transient failure from a permanent one:
+#   2 name not resolvable   3 connection/read failed   4 certificate pin mismatch
+#   5 HTTP error            6 TLS handshake failed
 pinned_get() {
-  "$PY" - "$1" "$2" "$3" "$4" "$FINGERPRINT" <<'PY'
-import hashlib, http.client, ssl, sys
-host, port, path, out, pin = sys.argv[1:6]
+  PYTHONIOENCODING=utf-8 "$PY" - "$1" "$2" "$3" "$4" "$FINGERPRINT" \
+      "$CONNECT_TIMEOUT" "$READ_TIMEOUT" <<'PY'
+import hashlib, http.client, socket, ssl, sys
+host, port, path, out, pin, connect_t, read_t = sys.argv[1:8]
+port = int(port)
+connect_t = float(connect_t)
+read_t = float(read_t)
+
+
+def fail(message, code):
+    sys.stderr.write(message + "\n")
+    raise SystemExit(code)
+
+
 ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
 ctx.check_hostname = False
 ctx.verify_mode = ssl.CERT_NONE
-conn = http.client.HTTPSConnection(host, int(port), context=ctx, timeout=60)
+ctx.minimum_version = ssl.TLSVersion.TLSv1_2
+
 try:
-    conn.connect()
+    raw = socket.create_connection((host, port), timeout=connect_t)
+except socket.gaierror as exc:
+    fail("Der Name %s liess sich nicht aufloesen (%s). Stimmt die Adresse?"
+         % (host, exc), 2)
+except (socket.timeout, TimeoutError):
+    fail("Keine Antwort von %s:%s innerhalb von %gs. Blockiert eine Firewall "
+         "oder ein Proxy die Verbindung? (Ausgangsport %s/TCP noetig)"
+         % (host, port, connect_t, port), 3)
 except OSError as exc:
-    sys.stderr.write("keine Verbindung zu %s:%s (%s)\n" % (host, port, exc))
-    sys.exit(3)
-der = conn.sock.getpeercert(binary_form=True)
+    fail("Keine Verbindung zu %s:%s (%s). Laeuft das Cockpit, und stimmt die "
+         "Adresse?" % (host, port, exc), 3)
+
+try:
+    tls = ctx.wrap_socket(raw, server_hostname=host)
+except (ssl.SSLError, OSError) as exc:
+    raw.close()
+    fail("Die verschluesselte Verbindung zu %s:%s ist fehlgeschlagen (%s). "
+         "Vermutlich antwortet an dieser Adresse ein anderer Dienst."
+         % (host, port, exc), 6)
+
+der = tls.getpeercert(binary_form=True) or b""
 got = "sha256:" + hashlib.sha256(der).hexdigest()
 if pin and got != pin:
-    sys.stderr.write("Zertifikat passt nicht: erhalten %s, erwartet %s\n" % (got, pin))
-    sys.exit(4)
-conn.request("GET", path, headers={"User-Agent": "agent-cockpit-installer/" + "0.1.0"})
-resp = conn.getresponse()
-body = resp.read()
-if resp.status != 200:
-    sys.stderr.write("Server antwortete mit HTTP %s für %s\n" % (resp.status, path))
-    sys.exit(5)
+    tls.close()
+    fail("Das Zertifikat passt nicht: erhalten %s, erwartet %s. Der Befehl "
+         "wurde moeglicherweise von einer anderen Adresse als der aktuellen "
+         "kopiert — im Cockpit einen neuen Befehl erzeugen." % (got, pin), 4)
+
+conn = http.client.HTTPSConnection(host, port, timeout=read_t, context=ctx)
+conn.sock = tls
+try:
+    conn.request("GET", path, headers={
+        "User-Agent": "agent-cockpit-installer/" + "0.1.0",
+        "Connection": "close"})
+    resp = conn.getresponse()
+    body = resp.read()
+    status = resp.status
+except (socket.timeout, TimeoutError):
+    tls.close()
+    fail("Der Server hat %s nicht innerhalb von %gs vollstaendig beantwortet."
+         % (path, read_t), 3)
+except (OSError, http.client.HTTPException) as exc:
+    tls.close()
+    fail("Die Uebertragung von %s wurde abgebrochen (%s)." % (path, exc), 3)
+finally:
+    try:
+        tls.close()
+    except OSError:
+        pass
+
+if status != 200:
+    fail("Der Server antwortete mit HTTP %s fuer %s." % (status, path), 5)
 if out == "-":
     sys.stdout.buffer.write(body)
 else:
     with open(out, "wb") as fh:
         fh.write(body)
 PY
+}
+
+# Fetch a path, retrying the failures that are worth retrying — a slow network, a
+# service still starting — and giving up at once on the ones that are not: a name
+# that does not resolve, a certificate that does not match, a wrong answer.
+#   fetch HOST PORT PATH OUTFILE
+fetch() {
+  _attempt=1
+  while : ; do
+    _code=0
+    pinned_get "$1" "$2" "$3" "$4" || _code=$?
+    [ "$_code" -eq 0 ] && return 0
+    case "$_code" in
+      2|4|5) return "$_code" ;;
+    esac
+    if [ "$_attempt" -ge "$FETCH_ATTEMPTS" ]; then
+      say "   Nach $FETCH_ATTEMPTS Versuchen keine stabile Verbindung." >&2
+      return "$_code"
+    fi
+    say "   Verbindung unterbrochen — neuer Versuch ($_attempt/$FETCH_ATTEMPTS) …" >&2
+    _attempt=$((_attempt + 1))
+    sleep 3
+  done
+}
+
+# Turn a fetch() exit code into one sentence the operator can act on.  The whole
+# point of distinct exit codes is that this can be specific.
+fetch_hint() {
+  case "$1" in
+    2) say "   Der Name der Cockpit-Adresse lässt sich auf diesem Computer nicht auflösen." >&2 ;;
+    3) say "   Die Verbindung kam nicht zustande. Prüfe die Internetverbindung; in Firmennetzen muss der Ausgangsport $DIST_PORT/TCP erlaubt sein." >&2 ;;
+    4) say "   Das Zertifikat passt nicht zum Fingerabdruck. Erzeuge im Cockpit einen neuen Befehl und führe genau diesen aus." >&2 ;;
+    5) say "   Der Server hat die Datei nicht herausgegeben. Vermutlich müssen im Cockpit zuerst die Installationsdateien gebaut werden." >&2 ;;
+    6) say "   An dieser Adresse antwortet kein Cockpit. Stimmen Host und Port?" >&2 ;;
+  esac
 }
 
 sha256_of() {
@@ -398,8 +497,15 @@ do_install() {
   say "   Name:       $NAME"
 
   # -- manifest ------------------------------------------------------------
-  MANIFEST="$(pinned_get "$DIST_HOST" "$DIST_PORT" "/dl/manifest.json" -)" \
-    || die "Das Cockpit ist nicht erreichbar oder das Zertifikat passt nicht. Stimmt die Adresse, und läuft der Dienst?"
+  # One retrying fetch, and a sentence that names what actually failed instead of
+  # one generic "not reachable" for every cause.
+  _code=0
+  MANIFEST="$(fetch "$DIST_HOST" "$DIST_PORT" "/dl/manifest.json" -)" || _code=$?
+  if [ "$_code" -ne 0 ]; then
+    say "   Das Cockpit unter $DIST_HOST:$DIST_PORT konnte nicht kontaktiert werden." >&2
+    fetch_hint "$_code"
+    die "Die Installation wurde abgebrochen — nichts wurde verändert."
+  fi
   read_manifest() {
     printf '%s' "$MANIFEST" | "$PY" -c \
       "import json,sys;d=json.load(sys.stdin);print(eval('d'+sys.argv[1]))" "$1"
@@ -434,11 +540,16 @@ do_install() {
   TMP="$APP/connector.pyz.part"
   if [ -n "$BUNDLE_URL" ]; then
     BUNDLE_PATH="${BUNDLE_URL#*://}"; BUNDLE_PATH="/${BUNDLE_PATH#*/}"
-    pinned_get "$DIST_HOST" "$DIST_PORT" "$BUNDLE_PATH" "$TMP" \
-      || die "Der Connector konnte nicht geladen werden."
   else
-    pinned_get "$DIST_HOST" "$DIST_PORT" "/dl/connector.pyz" "$TMP" \
-      || die "Der Connector konnte nicht geladen werden."
+    BUNDLE_PATH="/dl/connector.pyz"
+  fi
+  _code=0
+  fetch "$DIST_HOST" "$DIST_PORT" "$BUNDLE_PATH" "$TMP" || _code=$?
+  if [ "$_code" -ne 0 ]; then
+    rm -f "$TMP" 2>/dev/null || true
+    say "   Der Connector konnte nicht geladen werden ($BUNDLE_PATH)." >&2
+    fetch_hint "$_code"
+    die "Die Installation wurde abgebrochen — nichts wurde verändert."
   fi
   GOT_SHA="$(sha256_of "$TMP")"
   if [ -n "$BUNDLE_SHA" ] && [ "$GOT_SHA" != "$BUNDLE_SHA" ]; then
