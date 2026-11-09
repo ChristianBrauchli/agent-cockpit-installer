@@ -1,0 +1,37 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>CFBundleName</key>
+	<string>Agent Cockpit</string>
+	<key>CFBundleDisplayName</key>
+	<string>Agent Cockpit</string>
+	<key>CFBundleIdentifier</key>
+	<string>com.agentcockpit.pair</string>
+	<key>CFBundleExecutable</key>
+	<string>agent-cockpit-pair</string>
+	<key>CFBundlePackageType</key>
+	<string>APPL</string>
+	<key>CFBundleShortVersionString</key>
+	<string>1.0.0</string>
+	<key>CFBundleVersion</key>
+	<string>1</string>
+	<key>LSMinimumSystemVersion</key>
+	<string>11.0</string>
+	<key>LSApplicationCategoryType</key>
+	<string>public.app-category.developer-tools</string>
+	<!-- The only reason this app exists: to receive the pairing link a browser
+	     opens, so a Mac can be set up without a Terminal. -->
+	<key>CFBundleURLTypes</key>
+	<array>
+		<dict>
+			<key>CFBundleURLName</key>
+			<string>Agent Cockpit Pairing</string>
+			<key>CFBundleURLSchemes</key>
+			<array>
+				<string>agent-cockpit</string>
+			</array>
+		</dict>
+	</array>
+</dict>
+</plist>

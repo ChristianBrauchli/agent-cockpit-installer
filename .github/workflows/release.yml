@@ -1,8 +1,12 @@
 name: Release
 
-# A version tag publishes a GitHub Release carrying the bootstrap script and its
-# checksum, so a download can be verified against a published digest.  The
-# connector itself is never here: it is served by the operator's own cockpit.
+# A version tag publishes a GitHub Release carrying the bootstrap script, its
+# checksum and the macOS installer package.  The connector itself is never here:
+# it is served by the operator's own cockpit.
+#
+# The package is built on a macOS runner because `pkgbuild` exists nowhere else,
+# and the run checks what the package really contains rather than assuming the
+# build script did the right thing.
 on:
   push:
     tags:
@@ -14,12 +18,30 @@ permissions:
 
 jobs:
   release:
-    runs-on: ubuntu-latest
+    runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
 
       - name: Verify the installer against its published checksum
-        run: sha256sum -c SHA256SUMS
+        run: shasum -a 256 -c SHA256SUMS
+
+      - name: Lint the pairing helper's plist
+        run: plutil -lint "install/macos/app/Info.plist"
+
+      - name: Build the macOS package
+        run: sh install/macos/build_pkg.sh "$RUNNER_TEMP/AgentCockpit.pkg"
+
+      - name: Check what the package actually installs
+        run: |
+          set -eu
+          pkgutil --payload-files "$RUNNER_TEMP/AgentCockpit.pkg"
+          listing="$(pkgutil --payload-files "$RUNNER_TEMP/AgentCockpit.pkg")"
+          echo "$listing" | grep -q 'Applications/Agent Cockpit.app/Contents/MacOS/agent-cockpit-pair'
+          echo "$listing" | grep -q 'Applications/Agent Cockpit.app/Contents/Info.plist'
+          echo "$listing" | grep -q 'usr/local/bin/agent-cockpit-install'
+          # The app has to register the scheme the cockpit's pairing link uses,
+          # or the browser would have nothing to open.
+          grep -q '<string>agent-cockpit</string>' "install/macos/app/Info.plist"
 
       - name: Publish the release
         uses: softprops/action-gh-release@v2
@@ -27,4 +49,5 @@ jobs:
           files: |
             install.sh
             SHA256SUMS
+            ${{ runner.temp }}/AgentCockpit.pkg
           generate_release_notes: true

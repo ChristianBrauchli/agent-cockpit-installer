@@ -33,6 +33,24 @@ Everything is installed under `~/.agent-cockpit`. Nothing is installed globally,
 no `sudo` is used, and no secret travels in the command: the code is valid once
 and for fifteen minutes.
 
+## macOS: the package, for people who would rather not use a Terminal
+
+Each release also carries `AgentCockpit.pkg`. It installs two things:
+
+* `/Applications/Agent Cockpit.app` — a tiny helper that registers the
+  `agent-cockpit://` link scheme;
+* `/usr/local/bin/agent-cockpit-install` — this same installer.
+
+The cockpit's setup wizard then shows a **„Diesen Mac koppeln"** button whose link
+carries the address, the certificate fingerprint and the one-time code. Clicking
+it runs the helper, which installs the connector and pairs the Mac — nothing is
+typed and no Terminal is opened.
+
+The package is **unsigned and not notarised** (no Apple Developer ID is available
+for it), so Gatekeeper warns on first launch and asks you to confirm. That is
+expected, and it is stated in the package's own README rather than hidden.
+Signing would only add `productsign`/`notarytool` steps around the same payload.
+
 ## Options
 
 ```sh

@@ -1,0 +1,71 @@
+#!/bin/sh
+# Agent Cockpit — the pairing helper a browser launches on macOS.
+#
+# This is the executable inside "Agent Cockpit.app".  The app is generic: it
+# carries no address, no code and no secret.  The cockpit's setup wizard shows a
+# button that opens
+#
+#   agent-cockpit://pair?host=…&port=…&fp=…&code=…
+#
+# macOS hands that URL to this script as its first argument, and the script runs
+# the installer with it.  Nothing is typed, and no Terminal is needed.
+#
+# The fields are restricted to what a hostname, a port, a SHA-256 and a pairing
+# code can contain, so nothing that arrives from the browser can become shell
+# syntax: every value is checked against a character class before it is used.
+set -eu
+
+URL="${1:-}"
+case "$URL" in
+  agent-cockpit://pair*) ;;
+  *)
+    echo "Agent Cockpit: this is not a pairing link." >&2
+    exit 2
+    ;;
+esac
+
+QUERY="${URL#agent-cockpit://pair}"
+QUERY="${QUERY#\?}"
+[ -n "$QUERY" ] || { echo "Agent Cockpit: the pairing link is empty." >&2; exit 2; }
+
+field() { # field NAME — one value out of the query string
+  printf '%s' "$QUERY" | tr '&' '\n' | sed -n "s/^$1=//p" | head -n 1
+}
+
+HOST="$(field host)"
+PORT="$(field port)"
+FP="$(field fp)"
+CODE="$(field code)"
+
+refuse() { echo "Agent Cockpit: $1" >&2; exit 2; }
+case "$HOST" in "" | *[!A-Za-z0-9._-]*) refuse "invalid address" ;; esac
+case "$PORT" in "" | *[!0-9]*)           refuse "invalid port" ;; esac
+[ "${#PORT}" -le 5 ]                     || refuse "invalid port"
+case "$FP" in "" | *[!0-9a-f]*) refuse "invalid fingerprint" ;; esac
+[ "${#FP}" -eq 64 ]                      || refuse "invalid fingerprint"
+case "$CODE" in "" | *[!A-Z0-9-]*)       refuse "invalid pairing code" ;; esac
+
+# The package installs the installer at this path.  The variable exists so the
+# helper can be exercised on a machine that is not a Mac, which is where the
+# test suite runs.
+INSTALLER="${COCKPIT_MAC_INSTALLER:-/usr/local/bin/agent-cockpit-install}"
+[ -x "$INSTALLER" ] || refuse "the Agent Cockpit installer is missing; install the package first"
+
+NAME="$(hostname 2>/dev/null || echo Mac)"
+LOG="$(mktemp "${TMPDIR:-/tmp}/agent-cockpit.XXXXXX")"
+trap 'rm -f "$LOG"' EXIT
+
+say() { # say TITLE MESSAGE — a native dialog, the only UI a shell script has
+  osascript -e "display dialog \"$2\" buttons {\"OK\"} default button 1 with title \"$1\"" \
+    >/dev/null 2>&1 || true
+}
+
+if sh "$INSTALLER" --cockpit "$HOST:$PORT" \
+     --fingerprint "sha256:$FP" --code "$CODE" --name "$NAME" >"$LOG" 2>&1; then
+  say "Agent Cockpit" "Dieser Mac ist mit dem Cockpit verbunden.\n\nÖffne das Cockpit und wähle diesen Computer als Agentenlaufzeit aus."
+else
+  say "Agent Cockpit" "Die Einrichtung ist nicht gelungen.\n\nErzeuge im Cockpit einen neuen Code und öffne den Kopplungslink erneut."
+  # The detail is worth keeping: the dialog cannot hold it.
+  open -e "$LOG" 2>/dev/null || true
+  exit 1
+fi
