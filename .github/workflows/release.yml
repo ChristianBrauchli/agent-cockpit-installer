@@ -1,0 +1,30 @@
+name: Release
+
+# A version tag publishes a GitHub Release carrying the bootstrap script and its
+# checksum, so a download can be verified against a published digest.  The
+# connector itself is never here: it is served by the operator's own cockpit.
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Verify the installer against its published checksum
+        run: sha256sum -c SHA256SUMS
+
+      - name: Publish the release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            install.sh
+            SHA256SUMS
+          generate_release_notes: true
