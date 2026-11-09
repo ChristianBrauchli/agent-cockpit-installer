@@ -42,6 +42,12 @@ DRY_RUN=0
 UNINSTALL=0
 PURGE=0
 
+# What each stage actually did.  The closing screen reports these instead of
+# claiming success, so a service that did not start is never described as
+# running.  Values: skipped | ok | failed.
+PAIR_RESULT="skipped"
+SERVICE_RESULT="skipped"
+
 usage() {
   cat <<'USAGE'
 Agent Cockpit — Installation des Connectors
@@ -227,6 +233,7 @@ install_service_linux() {
   UNIT="$UNIT_DIR/agent-cockpit-connector.service"
   if ! command -v systemctl >/dev/null 2>&1; then
     warn "systemd ist nicht vorhanden — der Connector startet nicht automatisch."
+    SERVICE_RESULT="failed"
     return 1
   fi
   mkdir -p "$UNIT_DIR"
@@ -250,10 +257,22 @@ EOF
   systemctl --user daemon-reload 2>/dev/null || true
   systemctl --user enable agent-cockpit-connector.service >/dev/null 2>&1 || true
   systemctl --user restart agent-cockpit-connector.service >/dev/null 2>&1 || true
-  if systemctl --user is-active agent-cockpit-connector.service >/dev/null 2>&1; then
+  # A unit that is enabled is not a unit that is running.  Ask systemd, and let
+  # the closing screen say what it answered.
+  for _ in 1 2 3 4 5 6 7 8; do
+    if systemctl --user is-active agent-cockpit-connector.service >/dev/null 2>&1; then
+      SERVICE_RESULT="ok"
+      break
+    fi
+    sleep 0.5
+  done
+  if [ "$SERVICE_RESULT" = "ok" ]; then
     ok "Hintergrunddienst läuft (systemd --user)"
   else
-    warn "Der Dienst wurde eingerichtet, läuft aber noch nicht."
+    SERVICE_RESULT="failed"
+    warn "Der Dienst ist eingerichtet, läuft aber noch nicht:"
+    systemctl --user status agent-cockpit-connector.service --no-pager 2>&1 \
+      | tail -n 4 >&2 || true
   fi
   # Without lingering a user service stops when the last session ends.  Enabling
   # it may need administrator rights; say so rather than pretending.
@@ -299,8 +318,15 @@ EOF
   if command -v launchctl >/dev/null 2>&1; then
     launchctl unload "$PLIST" 2>/dev/null || true
     launchctl load -w "$PLIST" >/dev/null 2>&1 || true
-    ok "Hintergrunddienst eingerichtet (launchd) — startet automatisch nach der Anmeldung"
+    if launchctl list com.agentcockpit.connector >/dev/null 2>&1; then
+      SERVICE_RESULT="ok"
+      ok "Hintergrunddienst läuft (launchd) — startet automatisch nach der Anmeldung"
+    else
+      SERVICE_RESULT="failed"
+      warn "Der Dienst ist eingerichtet, ist aber nicht geladen."
+    fi
   else
+    SERVICE_RESULT="failed"
     warn "launchctl nicht gefunden — der Connector startet nicht automatisch."
     return 1
   fi
@@ -442,7 +468,8 @@ do_install() {
     case "$OS" in
       linux) install_service_linux || true ;;
       macos) install_service_macos || true ;;
-      *)     warn "Unbekanntes System — kein Dienst eingerichtet." ;;
+      *)     warn "Unbekanntes System — kein Dienst eingerichtet."
+             SERVICE_RESULT="failed" ;;
     esac
   fi
 
@@ -454,7 +481,6 @@ do_install() {
   case "$PAIR_RESULT" in
     ok)
       say "   Dieser Computer ist mit dem Cockpit verbunden."
-      say "   Der Connector läuft im Hintergrund und verbindet sich automatisch neu."
       say "   Öffne das Cockpit und wähle diesen Computer als Agentenlaufzeit aus."
       ;;
     failed)
@@ -466,6 +492,13 @@ do_install() {
       say "   Die Kopplung erfolgt im Cockpit unter „Computer verbinden“."
       ;;
   esac
+  # ...and whether the background service is really running, not merely written.
+  if [ "$DO_SERVICE" = "1" ]; then
+    case "$SERVICE_RESULT" in
+      ok) say "   Der Hintergrunddienst läuft und startet nach einem Neustart neu." ;;
+      failed) warn "Der Hintergrunddienst ist eingerichtet, startet aber noch nicht." ;;
+    esac
+  fi
   say ""
   say "   Deinstallieren:  sh install.sh --uninstall   (Agentendaten bleiben erhalten)"
 }
