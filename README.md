@@ -80,7 +80,7 @@ sh install.sh --uninstall --purge    # also removes sessions and the workspace
 ```
 
 The cockpit entry for the computer is removed separately, in the cockpit, under
-**„Verbundene Geräte"**.
+**„Geräte"**.
 
 ## Security
 
