@@ -48,12 +48,28 @@ DO_OPENCLAW=1
 DRY_RUN=0
 UNINSTALL=0
 PURGE=0
+# Repair means: keep the existing pairing and agent data, detect what is
+# missing, and install only that.  A repair never asks for the settings again and
+# never mints a second device.
+REPAIR=0
 
 # What each stage actually did.  The closing screen reports these instead of
 # claiming success, so a service that did not start is never described as
 # running.  Values: skipped | ok | failed.
 PAIR_RESULT="skipped"
 SERVICE_RESULT="skipped"
+OPENCLAW_RESULT="skipped"
+NODE_RESULT="skipped"
+
+# OpenClaw declares the Node.js versions it accepts in its own package.json
+# (`engines.node`), and the cockpit copies that declaration into the manifest.
+# A computer whose `node` lies outside the range cannot run OpenClaw at all —
+# npm fails inside a message that names no remedy — so the version is checked
+# before anything is installed, and a compatible Node is provided in the user's
+# own directory when the one on PATH does not fit.  An existing global Node is
+# never touched.
+NODE_REQUIREMENT=""     # e.g. ">=24.16.0 <25 || >=26.1.0", from the manifest
+NODE_BIN=""             # the bin directory the install (and the service) will use
 
 usage() {
   cat <<'USAGE'
@@ -69,6 +85,8 @@ Agent Cockpit — Installation des Connectors
   --bundle-sha256 HEX    Prüfsumme des Connector-Pakets überschreiben
   --no-service           keinen Hintergrunddienst einrichten
   --no-openclaw          OpenClaw nicht installieren (nur den Connector)
+  --repair               vorhandene Einrichtung reparieren: Kopplung und Daten
+                         bleiben erhalten, nur Fehlendes wird ergänzt
   --dry-run              nur anzeigen, was geschehen würde
   --uninstall            Connector entfernen (Agentendaten bleiben erhalten)
   --purge                mit --uninstall: auch die Agentendaten löschen
@@ -89,6 +107,7 @@ while [ $# -gt 0 ]; do
     --bundle-sha256)  BUNDLE_SHA="${2:-}"; shift 2 ;;
     --no-service)     DO_SERVICE=0; shift ;;
     --no-openclaw)    DO_OPENCLAW=0; shift ;;
+    --repair)         REPAIR=1; shift ;;
     --dry-run)        DRY_RUN=1; shift ;;
     --uninstall)      UNINSTALL=1; shift ;;
     --purge)          PURGE=1; shift ;;
@@ -281,6 +300,209 @@ print(h.hexdigest())
 PY
 }
 
+# ---------------------------------------------------------------- node.js ----
+# Does a version satisfy the range OpenClaw declares?  The range is npm's
+# `engines.node` syntax restricted to what OpenClaw actually writes: `>=`, `<=`,
+# `>`, `<` and `=` comparators, ANDed by spaces and ORed by `||`.  An empty
+# range means "no requirement" and always passes.
+node_version_ok() {  # node_version_ok VERSION RANGE
+  [ -n "$2" ] || return 0
+  "$PY" - "$1" "$2" <<'PY'
+import re, sys
+version, rng = sys.argv[1], sys.argv[2]
+
+def parts(v):
+    n = [int(x) for x in re.findall(r"\d+", v)[:3]]
+    return (n + [0, 0, 0])[:3]
+
+def cmp(a, b):
+    return (a > b) - (a < b)
+
+def clause_ok(clause, v):
+    for token in clause.split():
+        m = re.match(r"^(>=|<=|>|<|=)?v?([\d.]+)$", token)
+        if not m:
+            continue
+        op, num = m.group(1) or "=", parts(m.group(2))
+        c = cmp(v, num)
+        if op == ">=" and c < 0: return False
+        if op == ">" and c <= 0: return False
+        if op == "<=" and c > 0: return False
+        if op == "<" and c >= 0: return False
+        if op == "=" and c != 0: return False
+    return True
+
+v = parts(version)
+sys.exit(0 if any(clause_ok(c, v) for c in rng.split("||")) else 1)
+PY
+}
+
+# The lowest version the requirement accepts — what to download when a
+# compatible Node has to be provided.  Empty when the range names no lower bound.
+node_lowest_version() {  # node_lowest_version RANGE
+  [ -n "$1" ] || return 0
+  "$PY" - "$1" <<'PY'
+import re, sys
+best = None
+for clause in sys.argv[1].split("||"):
+    for token in clause.split():
+        m = re.match(r"^>=\s*v?([\d.]+)$", token)
+        if not m:
+            continue
+        v = tuple(([int(x) for x in re.findall(r"\d+", m.group(1))[:3]] + [0, 0, 0])[:3])
+        if best is None or v < best:
+            best = v
+print(".".join(str(x) for x in best) if best else "")
+PY
+}
+
+# The Node.js distribution name for this machine, or "" when there is none.
+node_platform() {
+  case "$OS:$ARCH" in
+    linux:x86_64|linux:amd64)   echo linux-x64 ;;
+    linux:aarch64|linux:arm64)  echo linux-arm64 ;;
+    macos:arm64|macos:aarch64)  echo darwin-arm64 ;;
+    macos:x86_64|macos:amd64)   echo darwin-x64 ;;
+    *)                          echo "" ;;
+  esac
+}
+
+# Download a Node.js release from nodejs.org, verify it against the release's
+# published checksum and unpack it under "$ROOT/node".  The tarball is extracted
+# by hand (never by an absolute path from the archive) so this works on every
+# python3 from 3.8 on, and symlinks are recreated only when they stay inside the
+# destination.
+fetch_node() {  # fetch_node VERSION PLATFORM
+  "$PY" - "$1" "$2" "$ROOT" "$CONNECT_TIMEOUT" "$READ_TIMEOUT" "$FETCH_ATTEMPTS" <<'PY'
+import hashlib, io, os, shutil, sys, tarfile, time
+import urllib.error, urllib.request
+
+version, platform, root, connect_t, read_t, attempts = sys.argv[1:7]
+root = os.path.expanduser(root)
+attempts = int(attempts)
+base = "https://nodejs.org/dist/v%s" % version
+tarball = "node-v%s-%s.tar.gz" % (version, platform)
+
+
+def get(url, timeout):
+    req = urllib.request.Request(url, headers={"User-Agent": "agent-cockpit-installer"})
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        return resp.read()
+
+
+def get_retry(url, timeout):
+    last = None
+    for attempt in range(attempts):
+        try:
+            return get(url, timeout)
+        except (urllib.error.URLError, OSError, ValueError) as exc:
+            last = exc
+            time.sleep(2)
+    raise SystemExit("Node.js konnte nicht geladen werden (%s): %s" % (url, last))
+
+
+shasums = get_retry(base + "/SHASUMS256.txt", float(read_t)).decode("utf-8", "replace")
+want = None
+for line in shasums.splitlines():
+    fields = line.split()
+    if len(fields) == 2 and fields[1] == tarball:
+        want = fields[0]
+if want is None:
+    raise SystemExit("Fuer %s liegt keine Pruefsumme vor." % tarball)
+
+data = get_retry(base + "/" + tarball, max(float(read_t), 600.0))
+got = hashlib.sha256(data).hexdigest()
+if got != want:
+    raise SystemExit("Die Pruefsumme von Node.js stimmt nicht (erhalten %s)." % got)
+
+dest = os.path.join(root, "node")
+staging = dest + ".new"
+shutil.rmtree(staging, ignore_errors=True)
+os.makedirs(staging, exist_ok=True)
+with tarfile.open(fileobj=io.BytesIO(data), mode="r:gz") as tf:
+    for member in tf.getmembers():
+        pieces = member.name.split("/", 1)
+        if len(pieces) < 2:
+            continue
+        rel = pieces[1]
+        if not rel or rel.startswith("/") or ".." in rel.split("/"):
+            continue
+        target = os.path.join(staging, rel)
+        if member.isdir():
+            os.makedirs(target, exist_ok=True)
+            os.chmod(target, member.mode & 0o777)
+        elif member.issym():
+            link = member.linkname
+            resolved = os.path.normpath(os.path.join(os.path.dirname(rel), link))
+            if os.path.isabs(link) or resolved.startswith(".."):
+                continue
+            os.makedirs(os.path.dirname(target), exist_ok=True)
+            if os.path.lexists(target):
+                os.remove(target)
+            os.symlink(link, target)
+        elif member.isfile():
+            os.makedirs(os.path.dirname(target), exist_ok=True)
+            source = tf.extractfile(member)
+            with open(target, "wb") as out:
+                shutil.copyfileobj(source, out)
+            os.chmod(target, member.mode & 0o777)
+shutil.rmtree(dest, ignore_errors=True)
+os.replace(staging, dest)
+print("Node.js %s bereitgestellt in %s" % (version, dest))
+PY
+}
+
+# Decide which `node` this install will use, providing one only when it must.
+# Idempotent: a compatible Node already provided under "$ROOT/node" is reused,
+# and a compatible global Node is left exactly as it is.
+ensure_node() {
+  WANT_NODE="$(node_lowest_version "$NODE_REQUIREMENT")"
+  if command -v node >/dev/null 2>&1; then
+    HAVE="$(node --version 2>/dev/null | sed 's/^v//')"
+    if node_version_ok "$HAVE" "$NODE_REQUIREMENT"; then
+      NODE_BIN="$(dirname "$(command -v node)")"
+      NODE_RESULT="ok"
+      ok "Node.js $HAVE ist vorhanden und passt zu OpenClaw"
+      return 0
+    fi
+    say "   Node.js $HAVE passt nicht zu OpenClaw (${NODE_REQUIREMENT})."
+    say "   Ich richte eine eigene, passende Node-Version ein — die vorhandene bleibt unberührt."
+  else
+    say "   Node.js ist nicht installiert. Ich richte eine eigene Version ein."
+  fi
+
+  # A previously provided, still-compatible Node is reused, so a re-run after a
+  # partial failure does not download anything again.
+  if [ -x "$ROOT/node/bin/node" ]; then
+    HAVE="$("$ROOT/node/bin/node" --version 2>/dev/null | sed 's/^v//')"
+    if node_version_ok "$HAVE" "$NODE_REQUIREMENT"; then
+      NODE_BIN="$ROOT/node/bin"
+      NODE_RESULT="ok"
+      ok "Eigene Node.js-Version $HAVE ist bereits eingerichtet"
+      return 0
+    fi
+  fi
+
+  PLATFORM="$(node_platform)"
+  if [ -z "$WANT_NODE" ] || [ -z "$PLATFORM" ]; then
+    warn "Für dieses System ($OS_LABEL) kann Node.js nicht automatisch eingerichtet werden."
+    warn "Bitte Node.js ${NODE_REQUIREMENT:-20 oder neuer} installieren und den Befehl erneut ausführen."
+    NODE_RESULT="failed"
+    return 1
+  fi
+  say "   Lade Node.js $WANT_NODE für $PLATFORM (kann einige Minuten dauern) …"
+  if fetch_node "$WANT_NODE" "$PLATFORM"; then
+    NODE_BIN="$ROOT/node/bin"
+    NODE_RESULT="provisioned"
+    ok "Node.js $WANT_NODE eingerichtet: $NODE_BIN"
+    return 0
+  fi
+  warn "Node.js konnte nicht automatisch eingerichtet werden. Bitte Node.js"
+  warn "${NODE_REQUIREMENT:-20 oder neuer} installieren und den Befehl erneut ausführen."
+  NODE_RESULT="failed"
+  return 1
+}
+
 # ------------------------------------------------------------- uninstall ----
 service_stop_and_remove() {
   case "$OS" in
@@ -340,6 +562,11 @@ install_service_linux() {
     return 1
   fi
   mkdir -p "$UNIT_DIR"
+  # The connector starts OpenClaw with `node` from its PATH, so the service must
+  # carry the same Node this install resolved — a service that cannot find the
+  # right Node would start and then be unable to run the agent.
+  SERVICE_PATH_LINE=""
+  [ -n "$NODE_BIN" ] && SERVICE_PATH_LINE="Environment=PATH=$NODE_BIN:/usr/local/bin:/usr/bin:/bin"
   cat > "$UNIT" <<EOF
 [Unit]
 Description=Agent Cockpit connector
@@ -350,6 +577,7 @@ Wants=network-online.target
 Type=simple
 Environment=COCKPIT_CONNECTOR_HOME=$ROOT
 Environment=COCKPIT_CONNECTOR_ROOT=$ROOT
+$SERVICE_PATH_LINE
 ExecStart=$PY $PYZ run
 Restart=always
 RestartSec=5
@@ -394,6 +622,11 @@ install_service_macos() {
   PLIST_DIR="$HOME_DIR/Library/LaunchAgents"
   PLIST="$PLIST_DIR/com.agentcockpit.connector.plist"
   mkdir -p "$PLIST_DIR"
+  # launchd gives a service almost no PATH of its own, so the Node this install
+  # resolved has to be named explicitly — otherwise the background agent could
+  # not find the same `node` the foreground install just proved works.
+  PLIST_PATH_XML=""
+  [ -n "$NODE_BIN" ] && PLIST_PATH_XML="    <key>PATH</key><string>$NODE_BIN:/usr/local/bin:/usr/bin:/bin</string>"
   cat > "$PLIST" <<EOF
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -410,6 +643,7 @@ install_service_macos() {
   <dict>
     <key>COCKPIT_CONNECTOR_HOME</key><string>$ROOT</string>
     <key>COCKPIT_CONNECTOR_ROOT</key><string>$ROOT</string>
+$PLIST_PATH_XML
   </dict>
   <key>RunAtLoad</key><true/>
   <key>KeepAlive</key><true/>
@@ -437,10 +671,21 @@ EOF
 }
 
 # --------------------------------------------------------------- openclaw ----
+# Install OpenClaw and prove it runs.  An npm exit code of 0 is not proof: the
+# real failure the operator hit was npm installing a tree that OpenClaw then
+# refuses to run on the machine's Node.  So the installed package's own
+# `engines.node` is read back and the CLI is executed once; only then is
+# OpenClaw reported as ready.
 install_openclaw() {
-  if ! command -v node >/dev/null 2>&1 || ! command -v npm >/dev/null 2>&1; then
-    warn "Node.js/npm fehlt — OpenClaw kann nicht installiert werden."
-    warn "Installiere Node.js 20 oder neuer, dann führe diesen Befehl erneut aus."
+  if ! ensure_node; then
+    warn "Ohne passende Node.js-Version kann OpenClaw nicht installiert werden."
+    OPENCLAW_RESULT="failed"
+    return 1
+  fi
+  PATH="$NODE_BIN:$PATH"; export PATH
+  if ! command -v npm >/dev/null 2>&1; then
+    warn "npm wurde nicht gefunden — OpenClaw kann nicht installiert werden."
+    OPENCLAW_RESULT="failed"
     return 1
   fi
   OC_DIR="$ROOT/openclaw"
@@ -450,7 +695,12 @@ install_openclaw() {
            "$OC_DIR/node_modules/openclaw/package.json" 2>/dev/null || echo '')"
     if [ -n "$HAVE" ] && [ "$HAVE" = "$OC_VERSION" ]; then
       ok "OpenClaw $HAVE ist bereits installiert (Konfiguration bleibt erhalten)"
-      return 0
+      if verify_openclaw "$OC_DIR"; then
+        OPENCLAW_RESULT="ok"
+        return 0
+      fi
+      OPENCLAW_RESULT="failed"
+      return 1
     fi
     [ -n "$HAVE" ] && say "   OpenClaw $HAVE gefunden, aktualisiere auf $OC_VERSION"
   fi
@@ -468,11 +718,48 @@ EOF
   say "   Installiere OpenClaw $OC_VERSION (kann einige Minuten dauern) …"
   if (cd "$OC_DIR" && npm install --no-audit --no-fund --loglevel=error >/dev/null 2>&1); then
     ok "OpenClaw $OC_VERSION installiert"
+  else
+    warn "Die OpenClaw-Installation ist fehlgeschlagen. Details:"
+    (cd "$OC_DIR" && npm install --no-audit --no-fund --loglevel=error 2>&1 | tail -n 15) || true
+    OPENCLAW_RESULT="failed"
+    return 1
+  fi
+  if verify_openclaw "$OC_DIR"; then
+    OPENCLAW_RESULT="ok"
     return 0
   fi
-  warn "Die OpenClaw-Installation ist fehlgeschlagen. Details:"
-  (cd "$OC_DIR" && npm install --no-audit --no-fund --loglevel=error 2>&1 | tail -n 15) || true
+  OPENCLAW_RESULT="failed"
   return 1
+}
+
+# Run the just-installed OpenClaw CLI with the Node we resolved, and check the
+# package's own engine declaration against that Node.  This is the check the
+# operator's failed Mac install never got.
+verify_openclaw() {
+  OC_DIR="$1"
+  PKG="$OC_DIR/node_modules/openclaw/package.json"
+  LAUNCH="$OC_DIR/node_modules/openclaw/openclaw.mjs"
+  if [ ! -f "$LAUNCH" ]; then
+    warn "OpenClaw wurde installiert, aber der Starter fehlt ($LAUNCH)."
+    return 1
+  fi
+  REQ="$("$PY" -c "import json,sys;d=json.load(open(sys.argv[1]));print((d.get('engines') or {}).get('node',''))" \
+        "$PKG" 2>/dev/null || echo '')"
+  NODE_V="$("$NODE_BIN/node" --version 2>/dev/null | sed 's/^v//')"
+  if ! node_version_ok "$NODE_V" "$REQ"; then
+    warn "OpenClaw $OC_VERSION verlangt Node $REQ, vorhanden ist $NODE_V."
+    return 1
+  fi
+  OUT="$(cd "$OC_DIR" && "$NODE_BIN/node" "$LAUNCH" --version 2>&1 | head -n 3)"
+  case "$OUT" in
+    *OpenClaw*)
+      ok "OpenClaw geprüft: $OUT"
+      return 0 ;;
+    *)
+      warn "OpenClaw liess sich nicht starten. Meldung:"
+      printf '%s\n' "$OUT" | tail -n 5 >&2
+      return 1 ;;
+  esac
 }
 
 # --------------------------------------------------------------- install ----
@@ -490,11 +777,19 @@ do_install() {
     *) die "--fingerprint muss mit 'sha256:' beginnen." ;;
   esac
 
-  step "Agent Cockpit — Installation"
+  if [ "$REPAIR" = "1" ]; then
+    [ -f "$ROOT/config.json" ] || die \
+      "Auf diesem Computer wurde keine Einrichtung gefunden ($ROOT/config.json fehlt).
+       Bitte den normalen Installationsbefehl aus dem Cockpit verwenden.
+       Es wurde nichts verändert."
+  fi
+
+  step "Agent Cockpit — $([ "$REPAIR" = "1" ] && echo Reparatur || echo Installation)"
   say "   System:     $OS_LABEL"
   say "   Cockpit:    $DIST_HOST:$DIST_PORT"
   say "   Zielordner: $ROOT"
   say "   Name:       $NAME"
+  [ "$REPAIR" = "1" ] && say "   Modus:      Reparatur — Kopplung und Agentendaten bleiben erhalten"
 
   # -- manifest ------------------------------------------------------------
   # One retrying fetch, and a sentence that names what actually failed instead of
@@ -522,13 +817,18 @@ do_install() {
   [ -n "$BUNDLE_URL" ] || BUNDLE_URL="$(read_manifest "['bundle']['url']")"
   [ -n "$BUNDLE_SHA" ] || BUNDLE_SHA="$(read_manifest "['bundle']['sha256']")"
   OC_VERSION="$(read_manifest "['openclaw']['version']")"
+  # The Node range OpenClaw declares for this exact version, straight from the
+  # cockpit's manifest.  An older cockpit that does not carry it leaves the range
+  # empty, and the check below then simply does not restrict anything.
+  NODE_REQUIREMENT="$(read_manifest "['openclaw'].get('node','')" 2>/dev/null || echo '')"
   ok "Cockpit erkannt (Installer-Version $MV, Connector-Kanal $HUB_HOST:$HUB_PORT)"
 
   if [ "$DRY_RUN" = "1" ]; then
     say ""
     say "   (Probelauf) Es würde nun:"
     say "     - der Connector nach $PYZ geladen und geprüft"
-    [ "$DO_OPENCLAW" = "1" ] && say "     - OpenClaw $OC_VERSION in $ROOT/openclaw installiert"
+    [ "$DO_OPENCLAW" = "1" ] && say "     - Node.js geprüft (${NODE_REQUIREMENT:-ohne Vorgabe}) und bei Bedarf passend eingerichtet"
+    [ "$DO_OPENCLAW" = "1" ] && say "     - OpenClaw $OC_VERSION in $ROOT/openclaw installiert und gestartet"
     [ "$DO_SERVICE" = "1" ] && say "     - ein Hintergrunddienst eingerichtet"
     say "     - dieser Computer mit dem Cockpit gekoppelt (Code $CODE)"
     return 0
@@ -562,7 +862,8 @@ do_install() {
 
   # -- OpenClaw ------------------------------------------------------------
   if [ "$DO_OPENCLAW" = "1" ]; then
-    install_openclaw || warn "OpenClaw fehlt noch — der Agent kann erst nach der Installation antworten."
+    step "Agent-Laufzeit (OpenClaw) einrichten"
+    install_openclaw || true
   fi
 
   # -- pairing -------------------------------------------------------------
@@ -579,6 +880,11 @@ do_install() {
       warn "Die Kopplung ist nicht gelungen. Der Code ist nur einmal und nur kurz gültig."
       warn "Im Cockpit einen neuen Code erzeugen und diesen Befehl erneut ausführen."
     fi
+  elif [ "$REPAIR" = "1" ]; then
+    # The point of a repair: the device token and its history stay.  Nothing is
+    # asked for and no second device row can be created.
+    PAIR_RESULT="kept"
+    ok "Bestehende Kopplung bleibt erhalten (kein neuer Code nötig)."
   else
     warn "Kein Kopplungscode angegeben — die Kopplung muss später im Cockpit erfolgen."
   fi
@@ -608,6 +914,9 @@ do_install() {
       say "   Die Installation ist abgeschlossen, die Kopplung aber NICHT."
       say "   Erzeuge im Cockpit einen neuen Code und führe denselben Befehl erneut aus."
       ;;
+    kept)
+      say "   Die Reparatur ist abgeschlossen; dieser Computer bleibt mit dem Cockpit verbunden."
+      ;;
     *)
       say "   Der Connector ist installiert, aber noch nicht gekoppelt."
       say "   Die Kopplung erfolgt im Cockpit unter „Computer verbinden“."
@@ -618,6 +927,15 @@ do_install() {
     case "$SERVICE_RESULT" in
       ok) say "   Der Hintergrunddienst läuft und startet nach einem Neustart neu." ;;
       failed) warn "Der Hintergrunddienst ist eingerichtet, startet aber noch nicht." ;;
+    esac
+  fi
+  # ...and whether OpenClaw really runs on this computer, not merely whether npm
+  # exited 0.  A missing runtime is stated as a missing runtime.
+  if [ "$DO_OPENCLAW" = "1" ]; then
+    case "$OPENCLAW_RESULT" in
+      ok) say "   Die Agent-Laufzeit OpenClaw ist eingerichtet und startbereit." ;;
+      failed) warn "OpenClaw ist noch NICHT einsatzbereit — der Agent kann nicht antworten."
+              warn "Bitte denselben Befehl erneut ausführen; er nimmt die Einrichtung wieder auf." ;;
     esac
   fi
   say ""
