@@ -62,6 +62,7 @@ sh install.sh --help
 | `--cockpit HOST:PORT` | the cockpit's download endpoint (required) |
 | `--fingerprint sha256:…` | the cockpit's certificate fingerprint (required) |
 | `--code CODE` | the one-time pairing code |
+| `--repair` | keep the pairing and the agent data, install only what is missing and start the service again — what the cockpit's “Einrichtung reparieren” hands out |
 | `--name NAME` | the name this computer shows in the cockpit |
 | `--hub-host HOST` | override the pairing hub's address (default: from the cockpit) |
 | `--hub-port PORT` | override the pairing hub's port (default: from the cockpit) |
